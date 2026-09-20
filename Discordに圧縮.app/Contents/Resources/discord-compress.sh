@@ -1,0 +1,801 @@
+#!/bin/bash
+# discord-compress v1.6.0
+# Discord にアップロードできるサイズへ動画を自動圧縮する（進捗表示つき）
+
+export PATH="/opt/homebrew/bin:/usr/local/bin:/opt/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
+VERSION="1.6.0"
+# 実ホーム（サービス経由など $HOME が違う環境でも実体を指す）
+_rh="$(/usr/bin/dscl . -read "/Users/$(/usr/bin/id -un)" NFSHomeDirectory 2>/dev/null | /usr/bin/awk '{print $2}')"
+case "$_rh" in /Users/*) HOME_DIR="$_rh" ;; *) HOME_DIR="$HOME" ;; esac
+CONF="$HOME_DIR/.config/discord-compress.conf"
+LOG="$HOME_DIR/Library/Logs/discord-compress.log"
+MARKER="/tmp/discord-compress.marker"
+QALOG="/tmp/discord-compress-qa.log"
+
+# -------------------------------- 既定値 -------------------------------------
+TARGET_MB=20
+SAFETY=0.93
+PRESET=medium
+ASK_SIZE=0
+ONE_PASS=0
+OUT_DIR=""
+OUT_SUFFIX="_discord"
+SKIP_IF_FITS=1
+REVEAL=1
+NOTIFY=1
+PROGRESS=auto
+ENCODER=auto
+HEVC=0
+HWDECODE=auto
+MAX_ATTEMPTS=4
+
+[ -f "$CONF" ] && . "$CONF" 2>/dev/null
+
+TARGET_MB="${DISCORD_TARGET_MB:-$TARGET_MB}"
+SAFETY="${DISCORD_SAFETY:-$SAFETY}"
+PRESET="${DISCORD_PRESET:-$PRESET}"
+ASK_SIZE="${DISCORD_ASK_SIZE:-$ASK_SIZE}"
+ONE_PASS="${DISCORD_ONE_PASS:-$ONE_PASS}"
+OUT_DIR="${DISCORD_OUT_DIR:-$OUT_DIR}"
+OUT_SUFFIX="${DISCORD_OUT_SUFFIX:-$OUT_SUFFIX}"
+SKIP_IF_FITS="${DISCORD_SKIP_IF_FITS:-$SKIP_IF_FITS}"
+REVEAL="${DISCORD_REVEAL:-$REVEAL}"
+NOTIFY="${DISCORD_NOTIFY:-$NOTIFY}"
+PROGRESS="${DISCORD_PROGRESS:-$PROGRESS}"
+PROG_FILE="${DISCORD_PROGRESS_FILE:-}"
+ENCODER="${DISCORD_ENCODER:-$ENCODER}"
+HEVC="${DISCORD_HEVC:-$HEVC}"
+HWDECODE="${DISCORD_HWDECODE:-$HWDECODE}"
+
+FFMPEG=""
+FFPROBE=""
+FF_ERR=""
+ENC_MODE=""
+VENC="libx264"
+VENC_LABEL="CPU (x264)"
+VT_H264=0
+VT_HEVC=0
+VT_OK=0
+HW_IN=-1
+HW_USE=0
+IS_ARM=0
+CHIP=""
+CUR_DUR_MS=0
+FILE_IDX=1
+FILE_TOTAL=1
+PROG_MODE=""
+PROG_T0=0
+PROG_NOTIFY_STEP=-1
+PROG_LOG_STEP=-1
+LAST_OUT=""
+DO_DOCTOR=0
+OSA_OUT=""
+OSA_ERR=""
+OSA_RC=0
+
+# -------------------------------- 基本関数 -----------------------------------
+log() {
+  mkdir -p "$(dirname "$LOG")" 2>/dev/null
+  printf '%s  %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$LOG" 2>/dev/null
+  /usr/bin/logger -t discord-compress "$*" 2>/dev/null
+  return 0
+}
+
+# 起動したことをクイックアクション側に知らせる目印
+mark_launch() {
+  printf '%s.%s\n' "$(date +%s)" "$$" > "$MARKER" 2>/dev/null
+  return 0
+}
+
+osa_esc() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
+
+# osascript をタイムアウト付きで実行する（GUI が出せない状況でも固まらない）
+osa_bg() {
+  local limit="$1"; shift
+  local o e pid w
+  o="$(mktemp "${TMPDIR:-/tmp}/dcosao.XXXXXX")"
+  e="$(mktemp "${TMPDIR:-/tmp}/dcosae.XXXXXX")"
+  /usr/bin/osascript "$@" >"$o" 2>"$e" &
+  pid=$!
+  w=0
+  while kill -0 "$pid" 2>/dev/null; do
+    if [ "$w" -ge "$limit" ]; then
+      kill -9 "$pid" 2>/dev/null
+      wait "$pid" 2>/dev/null
+      OSA_OUT=""; OSA_ERR="timeout"; OSA_RC=124
+      rm -f "$o" "$e"
+      return 124
+    fi
+    sleep 1
+    w=$((w + 1))
+  done
+  wait "$pid" 2>/dev/null
+  OSA_RC=$?
+  OSA_OUT="$(tr -d '\r' < "$o" 2>/dev/null | head -1)"
+  OSA_ERR="$(tr '\n' ' ' < "$e" 2>/dev/null | cut -c1-200)"
+  rm -f "$o" "$e"
+  return 0
+}
+
+notify() {
+  [ "$NOTIFY" = "1" ] || return 0
+  local msg ttl
+  msg="$(osa_esc "$1")"
+  ttl="$(osa_esc "${2:-Discord用に圧縮}")"
+  ( /usr/bin/osascript -e "display notification \"$msg\" with title \"$ttl\"" >/dev/null 2>&1 & ) >/dev/null 2>&1
+  return 0
+}
+
+alert() {
+  log "ALERT $1"
+  if [ -t 2 ]; then printf '%s\n' "$1" >&2; fi
+  notify "$1"
+  osa_bg 20 -e "display alert \"Discord用に圧縮\" message \"$(osa_esc "$1")\"" >/dev/null 2>&1
+  return 0
+}
+
+ievl() { awk "BEGIN{print int($1)}"; }
+fsize() { stat -f%z "$1" 2>/dev/null || echo 0; }
+human() { awk -v s="$1" 'BEGIN{ if (s>=1048576) printf "%.1fMB", s/1048576; else printf "%.0fKB", s/1024 }'; }
+
+usage() {
+  cat <<EOS
+discord-compress $VERSION
+使い方: discord-compress [オプション] 動画ファイル...
+
+  --target N       目標サイズ(MB)。既定 $TARGET_MB
+  --ask            実行時にダイアログでサイズを選ぶ
+  --onepass        1パスで高速に処理する
+  --gpu            Apple Silicon の GPU(VideoToolbox) で圧縮（既定で自動判定）
+  --cpu            CPU(x264) で圧縮（画質優先・低速）
+  --encoder MODE   auto|gpu|cpu（既定 auto）
+  --hevc           GPU で H.265 を使う（同容量で高画質・互換性は下がる）
+  --hwdecode       デコードも GPU で行う
+  --no-hwdecode    デコードは CPU で行う
+  --preset X       x264 preset（既定 $PRESET）
+  --outdir DIR     出力先ディレクトリ
+  --suffix STR     出力名の接尾辞（既定 $OUT_SUFFIX）
+  --force          既に収まっていても再圧縮する
+  --quiet          通知を出さない
+  --progress MODE  進捗表示 auto|tty|notify|file|none（既定 $PROGRESS）
+  --doctor         診断情報を表示する
+  --version        バージョン表示
+  -h, --help       このヘルプ
+EOS
+}
+
+# -------------------------------- ツール検出 ---------------------------------
+find_tools_quiet() {
+  local p
+  FFMPEG="$(command -v ffmpeg 2>/dev/null)"
+  FFPROBE="$(command -v ffprobe 2>/dev/null)"
+  if [ -z "$FFMPEG" ]; then
+    for p in /opt/homebrew/bin/ffmpeg /usr/local/bin/ffmpeg /opt/local/bin/ffmpeg; do
+      if [ -x "$p" ]; then FFMPEG="$p"; break; fi
+    done
+  fi
+  if [ -z "$FFPROBE" ]; then
+    for p in /opt/homebrew/bin/ffprobe /usr/local/bin/ffprobe /opt/local/bin/ffprobe; do
+      if [ -x "$p" ]; then FFPROBE="$p"; break; fi
+    done
+  fi
+  return 0
+}
+
+find_tools() {
+  find_tools_quiet
+  if [ -z "$FFMPEG" ] || [ -z "$FFPROBE" ]; then
+    alert "ffmpeg が見つかりません。ターミナルで brew install ffmpeg を実行してください。"
+    log "NG ffmpeg not found"
+    exit 3
+  fi
+  log "tools ffmpeg=$FFMPEG ffprobe=$FFPROBE"
+}
+
+# -------------------------------- 動画情報 -----------------------------------
+probe1() { "$FFPROBE" -v error -select_streams "$1" -show_entries "$2" -of default=nk=1:nw=1 "$3" 2>/dev/null | head -1; }
+probe_v() { local c; c="$(probe1 v:0 stream=codec_name "$1")"; printf '%s' "${c:-none}"; }
+probe_a() { local c; c="$(probe1 a:0 stream=codec_name "$1")"; printf '%s' "${c:-none}"; }
+
+fps_of() {
+  local r n d
+  r="$(probe1 v:0 stream=r_frame_rate "$1")"
+  case "$r" in
+    */*) n="${r%%/*}"; d="${r##*/}" ;;
+    *)   n="$r"; d=1 ;;
+  esac
+  awk -v n="$n" -v d="$d" 'BEGIN{ n=n+0; d=d+0; if (d>0) printf "%.3f", n/d; else printf "0" }'
+}
+
+duration_of() {
+  local f="$1" d np fps
+  d="$("$FFPROBE" -v error -show_entries format=duration -of default=nk=1:nw=1 "$f" 2>/dev/null | head -1)"
+  case "${d:-}" in ''|N/A|0|0.000000) d="" ;; esac
+  if [ -z "$d" ]; then
+    d="$(probe1 v:0 stream=duration "$f")"
+    case "${d:-}" in ''|N/A|0|0.000000) d="" ;; esac
+  fi
+  if [ -z "$d" ]; then
+    np="$("$FFPROBE" -v error -select_streams v:0 -count_packets -show_entries stream=nb_read_packets -of default=nk=1:nw=1 "$f" 2>/dev/null | head -1)"
+    case "${np:-}" in ''|N/A) np="" ;; esac
+    fps="$(fps_of "$f")"
+    if [ -n "$np" ]; then
+      d="$(awk -v n="$np" -v f="$fps" 'BEGIN{ n=n+0; f=f+0; if (f>0) printf "%.6f", n/f }')"
+    fi
+  fi
+  printf '%s' "${d:-}"
+}
+
+# -------------------------------- 画質ラダー ---------------------------------
+pixb_for() {
+  local k="$1"
+  if   [ "$k" -ge 3200 ]; then echo 2073600
+  elif [ "$k" -ge 1500 ]; then echo 921600
+  elif [ "$k" -ge 900 ];  then echo 518400
+  elif [ "$k" -ge 560 ];  then echo 409920
+  elif [ "$k" -ge 330 ];  then echo 230400
+  elif [ "$k" -ge 190 ];  then echo 129600
+  else echo 76800; fi
+}
+
+lower_pixb() {
+  case "$1" in
+    2073600) echo 921600 ;;
+    921600)  echo 518400 ;;
+    518400)  echo 409920 ;;
+    409920)  echo 230400 ;;
+    230400)  echo 129600 ;;
+    129600)  echo 76800 ;;
+    76800)   echo 43200 ;;
+    *)       echo 19200 ;;
+  esac
+}
+
+fps_cap_for() {
+  local k="$1"
+  if   [ "$k" -ge 3200 ]; then echo 60
+  elif [ "$k" -ge 900 ];  then echo 30
+  elif [ "$k" -ge 330 ];  then echo 24
+  elif [ "$k" -ge 190 ];  then echo 20
+  else echo 15; fi
+}
+
+abps_for() {
+  local k="$1"
+  if   [ "$k" -ge 1500 ]; then echo 128
+  elif [ "$k" -ge 700 ];  then echo 96
+  elif [ "$k" -ge 330 ];  then echo 64
+  elif [ "$k" -ge 190 ];  then echo 48
+  else echo 32; fi
+}
+
+build_vf() {
+  local pixb="$1" srcfps="$2" cap="$3" vf
+  vf='scale=w=trunc(iw*min(1\,sqrt('"$pixb"'/(iw*ih)))/2)*2:h=trunc(ih*min(1\,sqrt('"$pixb"'/(iw*ih)))/2)*2:flags=lanczos,setsar=1'
+  if awk -v a="$srcfps" -v b="$cap" 'BEGIN{ exit !(a+0 > b+0.01) }'; then
+    vf="fps=$cap,$vf"
+  fi
+  printf '%s' "$vf"
+}
+
+# -------------------------------- 進捗表示 -----------------------------------
+prog_resolve() {
+  case "$PROGRESS" in
+    none|off|0) PROG_MODE=none ;;
+    tty)        PROG_MODE=tty ;;
+    notify)     PROG_MODE=notify ;;
+    file)       PROG_MODE=file ;;
+    *)
+      if [ -n "$PROG_FILE" ]; then PROG_MODE=file
+      elif [ -t 1 ]; then PROG_MODE=tty
+      else PROG_MODE=notify; fi
+      ;;
+  esac
+  if [ "$PROG_MODE" = "notify" ] && [ "$NOTIFY" != "1" ]; then PROG_MODE=none; fi
+  PROG_T0="$(date +%s)"
+  return 0
+}
+
+prog_bar() {
+  local p="$1" w=24 i=0 s=""
+  while [ "$i" -lt "$w" ]; do
+    if [ $(( i * 100 / w )) -lt "$p" ]; then s="$s#"; else s="$s-"; fi
+    i=$((i + 1))
+  done
+  printf '%s' "$s"
+}
+
+prog_emit() {
+  local pct="$1" msg="$2" now elapsed rem eta="" step
+  if [ "$pct" -lt 0 ]; then pct=0; fi
+  if [ "$pct" -gt 100 ]; then pct=100; fi
+  now="$(date +%s)"
+  elapsed=$(( now - PROG_T0 ))
+  if [ "$pct" -ge 3 ] && [ "$elapsed" -ge 3 ]; then
+    rem=$(( elapsed * (100 - pct) / pct ))
+    eta="$(printf '残り %d:%02d' $(( rem / 60 )) $(( rem % 60 )))"
+  fi
+  if [ -n "$PROG_FILE" ]; then
+    printf '%d|%s|%s\n' "$pct" "$msg" "$eta" > "$PROG_FILE.tmp" 2>/dev/null && mv -f "$PROG_FILE.tmp" "$PROG_FILE" 2>/dev/null
+  fi
+  step=$(( pct / 10 ))
+  if [ "$step" -gt "$PROG_LOG_STEP" ]; then
+    PROG_LOG_STEP="$step"
+    log "progress ${pct}% $msg $eta"
+  fi
+  case "$PROG_MODE" in
+    tty)
+      printf '\r\033[K  [%s] %3d%%  %s  %s' "$(prog_bar "$pct")" "$pct" "$msg" "$eta"
+      ;;
+    notify)
+      step=$(( pct / 25 ))
+      if [ "$step" -gt "$PROG_NOTIFY_STEP" ] && [ "$pct" -gt 0 ] && [ "$pct" -lt 100 ]; then
+        PROG_NOTIFY_STEP="$step"
+        notify "${pct}% 完了  $msg  $eta" "圧縮中…"
+      fi
+      ;;
+  esac
+  return 0
+}
+
+prog_local() {
+  local lp="$1" m="$2" ov
+  ov=$(( ( (FILE_IDX - 1) * 100 + lp ) / FILE_TOTAL ))
+  if [ "$FILE_TOTAL" -gt 1 ]; then m="$m (${FILE_IDX}/${FILE_TOTAL}本目)"; fi
+  prog_emit "$ov" "$m"
+}
+
+prog_end() {
+  if [ "$PROG_MODE" = "tty" ]; then printf '\n'; fi
+  if [ -n "$PROG_FILE" ]; then printf '100|完了しました|\n' > "$PROG_FILE" 2>/dev/null; fi
+  return 0
+}
+
+# ffmpeg を -progress 付きで実行し、進捗を更新する
+ff_run() {
+  local label="$1" base="$2" span="$3"; shift 3
+  local pf err pid rc us cur pct
+  pf="$(mktemp "${TMPDIR:-/tmp}/dcffp.XXXXXX")"
+  err="$(mktemp "${TMPDIR:-/tmp}/dcffe.XXXXXX")"
+  "$FFMPEG" -nostdin -y -hide_banner -loglevel error -progress "$pf" -nostats "$@" >/dev/null 2>"$err" &
+  pid=$!
+  while kill -0 "$pid" 2>/dev/null; do
+    us="$(grep -a '^out_time_us=' "$pf" 2>/dev/null | tail -1 | cut -d= -f2)"
+    case "${us:-x}" in ''|*[!0-9]*) us=0 ;; esac
+    if [ "$CUR_DUR_MS" -gt 0 ]; then
+      cur=$(( us / 1000 ))
+      pct=$(( base + cur * span / CUR_DUR_MS ))
+    else
+      pct="$base"
+    fi
+    if [ "$pct" -gt $(( base + span )) ]; then pct=$(( base + span )); fi
+    prog_local "$pct" "$label"
+    sleep 0.5
+  done
+  wait "$pid"
+  rc=$?
+  FF_ERR="$(tail -3 "$err" 2>/dev/null | tr '\n' ' ')"
+  rm -f "$pf" "$err"
+  prog_local $(( base + span )) "$label"
+  return "$rc"
+}
+
+# ---------------------------- GPU (VideoToolbox) -----------------------------
+# Apple Silicon (M1/M2/M3...) の内蔵メディアエンジン/GPU を使って高速に圧縮する
+detect_gpu() {
+  local encs
+  IS_ARM=0
+  case "$(uname -m)" in arm64) IS_ARM=1 ;; esac
+  CHIP="$(sysctl -n machdep.cpu.brand_string 2>/dev/null)"
+  [ -n "$CHIP" ] || CHIP="$(sysctl -n hw.model 2>/dev/null)"
+  VT_H264=0
+  VT_HEVC=0
+  if [ -n "$FFMPEG" ]; then
+    encs="$("$FFMPEG" -hide_banner -encoders 2>/dev/null)"
+    case "$encs" in *h264_videotoolbox*) VT_H264=1 ;; esac
+    case "$encs" in *hevc_videotoolbox*) VT_HEVC=1 ;; esac
+  fi
+}
+
+# 5フレームだけ実際に試し、GPU エンコーダが本当に動くか確認する
+gpu_smoke() {
+  "$FFMPEG" -nostdin -hide_banner -loglevel error -f lavfi -i "testsrc2=size=320x240:rate=10:duration=0.5" -c:v "$1" -b:v 300k -frames:v 5 -f null - >/dev/null 2>&1
+}
+
+resolve_encoder() {
+  local want
+  case "$ENCODER" in
+    gpu|GPU|hw|vt|videotoolbox) want=gpu ;;
+    cpu|CPU|sw|x264) want=cpu ;;
+    *) want=auto ;;
+  esac
+  ENC_MODE=cpu
+  VENC="libx264"
+  VENC_LABEL="CPU (x264)"
+  VT_OK=0
+  if [ "$want" != "cpu" ]; then
+    if [ "$HEVC" = "1" ] && [ "$VT_HEVC" = "1" ] && gpu_smoke hevc_videotoolbox; then
+      ENC_MODE=gpu; VENC="hevc_videotoolbox"; VENC_LABEL="GPU (VideoToolbox HEVC)"; VT_OK=1
+    elif [ "$VT_H264" = "1" ] && gpu_smoke h264_videotoolbox; then
+      ENC_MODE=gpu; VENC="h264_videotoolbox"; VENC_LABEL="GPU (VideoToolbox H.264)"; VT_OK=1
+    elif [ "$want" = "gpu" ]; then
+      log "GPU を使えないため CPU で処理します (arm64=$IS_ARM vt_h264=$VT_H264 vt_hevc=$VT_HEVC)"
+    fi
+  fi
+  case "$HWDECODE" in
+    1|yes|on|true) HW_IN=1 ;;
+    0|no|off|false) HW_IN=0 ;;
+    *) HW_IN=-1 ;;
+  esac
+  [ "$ENC_MODE" = "gpu" ] || HW_IN=0
+  log "encoder=$VENC mode=$ENC_MODE hwdecode=$HW_IN chip=$CHIP"
+}
+
+# GPU は 1 パス固定なので同じビットレートだと x264 よりやや不利。
+# 解像度の選び方を少し厳しめにして体感画質を保つ。
+pixb_pick() {
+  local k="$1" f=100
+  if [ "$ENC_MODE" = "gpu" ]; then
+    if [ "$VENC" = "hevc_videotoolbox" ]; then f=95; else f=78; fi
+  fi
+  pixb_for "$(ievl "$k*$f/100")"
+}
+
+# 4K/1440p の H.264/HEVC はデコードも GPU に任せた方が速い
+hw_decode_flag() {
+  local src="$1" vc w
+  case "$HW_IN" in
+    1) echo 1; return 0 ;;
+    0) echo 0; return 0 ;;
+  esac
+  vc="$("$FFPROBE" -v error -select_streams v:0 -show_entries stream=codec_name -of csv=p=0 "$src" 2>/dev/null | head -1 | tr -d '\r')"
+  case "$vc" in h264|hevc) ;; *) echo 0; return 0 ;; esac
+  w="$("$FFPROBE" -v error -select_streams v:0 -show_entries stream=width -of csv=p=0 "$src" 2>/dev/null | head -1 | tr -d '\r')"
+  case "$w" in ''|*[!0-9]*) echo 0; return 0 ;; esac
+  if [ "$w" -ge 2560 ]; then echo 1; else echo 0; fi
+}
+
+encode_gpu() {
+  local src="$1" out="$2" vk="$3" ak="$4" vf="$5" base="$6" span="$7"
+  local maxrate bufsize
+  local -a aopt hw tag
+  maxrate=$(( vk * 135 / 100 ))
+  bufsize=$(( vk * 2 ))
+  HW_USE="$(hw_decode_flag "$src")"
+  if [ "$ak" -gt 0 ]; then aopt=(-c:a aac -b:a "${ak}k" -ac 2); else aopt=(-an); fi
+  if [ "$HW_USE" = "1" ]; then hw=(-hwaccel videotoolbox); else hw=(); fi
+  if [ "$VENC" = "hevc_videotoolbox" ]; then tag=(-tag:v hvc1); else tag=(-profile:v high); fi
+  ff_run "GPUでエンコード中" "$base" "$span" "${hw[@]}" -i "$src" -vf "$vf" -c:v "$VENC" -b:v "${vk}k" -maxrate "${maxrate}k" -bufsize "${bufsize}k" "${tag[@]}" -pix_fmt yuv420p "${aopt[@]}" -movflags +faststart "$out"
+}
+
+encode_cpu() {
+  local src="$1" out="$2" vk="$3" ak="$4" vf="$5" base="$6" span="$7"
+  local maxrate bufsize rc s1 s2
+  local -a aopt
+  maxrate=$(( vk * 145 / 100 ))
+  bufsize=$(( vk * 25 / 10 ))
+  if [ "$ak" -gt 0 ]; then aopt=(-c:a aac -b:a "${ak}k" -ac 2); else aopt=(-an); fi
+  if [ "$ONE_PASS" = "1" ]; then
+    ff_run "エンコード中" "$base" "$span" -i "$src" -vf "$vf" -c:v libx264 -preset "$PRESET" -profile:v high -pix_fmt yuv420p -b:v "${vk}k" -maxrate "${maxrate}k" -bufsize "${bufsize}k" "${aopt[@]}" -movflags +faststart "$out"
+    return $?
+  fi
+  s1=$(( span * 40 / 100 ))
+  s2=$(( span - s1 ))
+  ff_run "解析中 1/2" "$base" "$s1" -i "$src" -vf "$vf" -c:v libx264 -preset "$PRESET" -profile:v high -pix_fmt yuv420p -b:v "${vk}k" -maxrate "${maxrate}k" -bufsize "${bufsize}k" -an -pass 1 -passlogfile "$PASSLOG" -f null /dev/null
+  rc=$?
+  if [ "$rc" -ne 0 ]; then return "$rc"; fi
+  ff_run "エンコード中 2/2" $(( base + s1 )) "$s2" -i "$src" -vf "$vf" -c:v libx264 -preset "$PRESET" -profile:v high -pix_fmt yuv420p -b:v "${vk}k" -maxrate "${maxrate}k" -bufsize "${bufsize}k" "${aopt[@]}" -pass 2 -passlogfile "$PASSLOG" -movflags +faststart "$out"
+  return $?
+}
+
+# GPU が使えるときは GPU、失敗したら自動的に CPU へフォールバック
+encode() {
+  local rc
+  if [ "$ENC_MODE" = "gpu" ]; then
+    encode_gpu "$@"
+    rc=$?
+    if [ "$rc" -eq 0 ]; then return 0; fi
+    log "NG GPU エンコード失敗 rc=$rc $FF_ERR -> CPU にフォールバック"
+    ENC_MODE=cpu
+    VENC="libx264"
+    VENC_LABEL="CPU (x264)"
+    HW_USE=0
+  fi
+  encode_cpu "$@"
+}
+
+out_path_for() {
+  local src="$1" dir base
+  if [ -n "$OUT_DIR" ]; then dir="$OUT_DIR"; else dir="$(dirname "$src")"; fi
+  base="$(basename "$src")"
+  base="${base%.*}"
+  printf '%s/%s%s.mp4' "$dir" "$base" "$OUT_SUFFIX"
+}
+
+# サイズ選択ダイアログ（応答が無ければ既定サイズで続行）
+ask_size() {
+  local limit sel n
+  limit="${DISCORD_ASK_TIMEOUT:-45}"
+  osa_bg "$limit" \
+    -e 'set opts to {"20 MB - 無料プラン（既定）", "10 MB - 安全側（旧上限）", "50 MB - Nitro Basic", "500 MB - Nitro"}' \
+    -e 'set res to choose from list opts with title "Discord用に圧縮" with prompt "目標サイズを選んでください" default items {item 1 of opts} OK button name "圧縮" cancel button name "キャンセル"' \
+    -e 'if res is false then' -e 'return "CANCEL"' -e 'else' -e 'return item 1 of res' -e 'end if'
+  sel="$OSA_OUT"
+  if [ "$OSA_RC" = "124" ]; then
+    log "ask_size: ダイアログ応答なし(${limit}s) -> ${TARGET_MB}MB で続行"
+    notify "サイズ選択ダイアログを開けませんでした。${TARGET_MB}MB で圧縮します"
+    return 0
+  fi
+  if [ "$sel" = "CANCEL" ]; then
+    log "ask_size: キャンセルされました"
+    return 1
+  fi
+  if [ -z "$sel" ]; then
+    log "ask_size: ダイアログを表示できません rc=$OSA_RC err=$OSA_ERR -> ${TARGET_MB}MB で続行"
+    notify "サイズ選択ダイアログを開けませんでした。${TARGET_MB}MB で圧縮します"
+    return 0
+  fi
+  n="$(printf '%s' "$sel" | sed -n 's/^\([0-9]*\).*/\1/p')"
+  if [ -n "$n" ]; then TARGET_MB="$n"; fi
+  log "ask_size: ${TARGET_MB}MB を選択"
+  return 0
+}
+
+# -------------------------------- 診断 ---------------------------------------
+doctor() {
+  local w d found
+  echo "discord-compress $VERSION"
+  echo "macOS: $(sw_vers -productVersion) ($(uname -m))"
+  echo "ログ: $LOG"
+  if [ -f "$CONF" ]; then echo "設定: $CONF"; else echo "設定: (なし)"; fi
+  find_tools_quiet
+  echo "ffmpeg:  ${FFMPEG:-見つかりません}"
+  echo "ffprobe: ${FFPROBE:-見つかりません}"
+  if [ -n "$FFMPEG" ]; then echo "         $("$FFMPEG" -version 2>/dev/null | head -1)"; fi
+  if [ -t 1 ]; then echo "進捗表示: PROGRESS=$PROGRESS (端末あり→バー表示)"; else echo "進捗表示: PROGRESS=$PROGRESS (端末なし→通知)"; fi
+  echo "クイックアクション:"
+  found=0
+  for w in "$HOME_DIR/Library/Services"/*.workflow; do
+    [ -e "$w" ] || continue
+    found=1
+    echo "  - $(basename "$w") : $(/usr/libexec/PlistBuddy -c 'Print :NSServices:0:NSMenuItem:default' "$w/Contents/Info.plist" 2>/dev/null)"
+  done
+  if [ "$found" = "0" ]; then echo "  (インストールされていません)"; fi
+  echo "アプリ:"
+  found=0
+  for w in "$HOME_DIR/Applications"/*.app; do
+    [ -e "$w" ] || continue
+    case "$(basename "$w")" in
+      *Discord*|*圧縮*) echo "  - $(basename "$w")"; found=1 ;;
+    esac
+  done
+  if [ "$found" = "0" ]; then echo "  (インストールされていません)"; fi
+  echo "サービス登録(pbs):"
+  /System/Library/CoreServices/pbs -dump 2>/dev/null | grep -o 'Compress for Discord[^"]*\.workflow' | sort -u | sed 's/^/  - /'
+  echo "書き込みテスト:"
+  for d in "$HOME_DIR/Desktop" "$HOME_DIR/Downloads" "$HOME_DIR/Movies"; do
+    if ( : > "$d/.dcwtest" ) 2>/dev/null; then rm -f "$d/.dcwtest"; echo "  - $d : OK"; else echo "  - $d : NG (フルディスクアクセスが必要かもしれません)"; fi
+  done
+  osa_bg 10 -e 'display notification "診断テストです" with title "Discord用に圧縮"'
+  if [ "$OSA_RC" = "0" ]; then echo "通知: OK"; else echo "通知: NG (rc=$OSA_RC $OSA_ERR)"; fi
+  echo "ログ末尾:"
+  tail -8 "$LOG" 2>/dev/null | sed 's/^/  /'
+  detect_gpu
+  resolve_encoder
+  echo "チップ        : ${CHIP:-不明} (arm64=$IS_ARM)"
+  if [ "$VT_OK" = "1" ]; then
+    echo "GPU圧縮     : 利用できます (h264_videotoolbox=$VT_H264 hevc_videotoolbox=$VT_HEVC)"
+  else
+    echo "GPU圧縮     : 使えません (h264_videotoolbox=$VT_H264 hevc_videotoolbox=$VT_HEVC)"
+  fi
+  echo "エンコーダ  : $VENC_LABEL  [encoder=$ENCODER hevc=$HEVC hwdecode=$HWDECODE]"
+  echo "ホーム        : $HOME_DIR (HOME=$HOME)"
+  echo "右クリック診断:"
+  echo "  サービス無効化設定(pbs):"
+  if defaults read pbs NSServicesStatus 2>/dev/null | grep -q "Compress for Discord"; then
+    defaults read pbs NSServicesStatus 2>/dev/null | grep -A3 "Compress for Discord" | sed "s/^/    /" | head -24
+  else
+    echo "    記載なし（既定＝有効）"
+  fi
+  echo "  ワークフロー構成:"
+  for w in "$HOME_DIR/Library/Services"/*.workflow; do
+    [ -e "$w" ] || continue
+    DOC_TI="$(plutil -extract workflowMetaData.workflowTypeIdentifier raw -o - "$w/Contents/document.wflow" 2>/dev/null)"
+    DOC_SI="$(plutil -extract workflowMetaData.serviceInputTypeIdentifier raw -o - "$w/Contents/document.wflow" 2>/dev/null)"
+    DOC_AI="$(plutil -extract workflowMetaData.serviceApplicationBundleID raw -o - "$w/Contents/document.wflow" 2>/dev/null)"
+    echo "    $(basename "$w"): type=${DOC_TI:-?} input=${DOC_SI:-?} app=${DOC_AI:-?}"
+  done
+  echo "  右クリック実行の記録:"
+  if [ -f "$QALOG" ]; then
+    tail -12 "$QALOG" | sed "s/^/    /"
+  else
+    echo "    記録なし（クイックアクションのスクリプトが一度も実行されていません）"
+  fi
+}
+
+# -------------------------------- 本体 ---------------------------------------
+compress_one() {
+  local src="$1"
+  local name size dur vcodec acodec srcfps out odir ext
+  local total_kbps abps vkbps eff src_kbps cap_kbps pixb fpscap vf attempt outsize rc
+  name="$(basename "$src")"
+  if [ ! -f "$src" ]; then log "SKIP not a file: $src"; return 2; fi
+  size="$(fsize "$src")"
+  dur="$(duration_of "$src")"
+  if [ -z "$dur" ] || [ "$(ievl "($dur > 0)")" != "1" ]; then
+    alert "再生時間を取得できませんでした: $name"
+    return 1
+  fi
+  CUR_DUR_MS="$(ievl "$dur*1000")"
+  vcodec="$(probe_v "$src")"
+  acodec="$(probe_a "$src")"
+  srcfps="$(fps_of "$src")"
+  ext="$(printf '%s' "${name##*.}" | tr 'A-Z' 'a-z')"
+  if [ "$SKIP_IF_FITS" = "1" ] && [ "$size" -le "$BUDGET" ] && [ "$vcodec" = "h264" ]; then
+    case "$ext" in
+      mp4|m4v)
+        log "SKIP fits: $name ($size bytes)"
+        prog_local 100 "そのまま送れます"
+        notify "$name はそのまま送れます（$(human "$size")）"
+        return 2
+        ;;
+    esac
+  fi
+  out="$(out_path_for "$src")"
+  odir="$(dirname "$out")"
+  if ! ( : > "$odir/.dcwtest.$$" ) 2>/dev/null; then
+    alert "書き込みできません: $odir（システム設定 → プライバシーとセキュリティ → フルディスクアクセス を確認してください）"
+    return 1
+  fi
+  rm -f "$odir/.dcwtest.$$"
+  total_kbps="$(ievl "$BUDGET*8/1000/$dur")"
+  if [ "$ENC_MODE" = "gpu" ]; then total_kbps="$(ievl "$total_kbps*0.98")"; fi
+  if [ "$acodec" = "none" ]; then abps=0; else abps="$(abps_for "$total_kbps")"; fi
+  vkbps=$(( total_kbps - abps ))
+  if [ "$vkbps" -lt 40 ]; then vkbps=40; fi
+  case "$vcodec" in
+    hevc|h265|av1|vp9) eff=1.8 ;;
+    *) eff=1.05 ;;
+  esac
+  src_kbps="$(ievl "$size*8/1000/$dur")"
+  cap_kbps="$(ievl "($src_kbps - $abps) * $eff")"
+  if [ "$cap_kbps" -lt 40 ]; then cap_kbps=40; fi
+  if [ "$cap_kbps" -lt "$vkbps" ]; then
+    log "cap vk ${vkbps}k -> ${cap_kbps}k (source ${src_kbps}k $vcodec eff=$eff)"
+    vkbps="$cap_kbps"
+  fi
+  log "START $src size=$size dur=$dur vcodec=$vcodec acodec=$acodec fps=$srcfps target=${TARGET_MB}MB budget=$BUDGET"
+  prog_local 0 "準備中"
+  pixb="$(pixb_pick "$vkbps")"
+  attempt=1
+  while [ "$attempt" -le "$MAX_ATTEMPTS" ]; do
+    fpscap="$(fps_cap_for "$vkbps")"
+    vf="$(build_vf "$pixb" "$srcfps" "$fpscap")"
+    log "try$attempt vk=${vkbps}k a=${abps}k pixbudget=$pixb fpscap=$fpscap"
+    encode "$src" "$out" "$vkbps" "$abps" "$vf" 0 100
+    rc=$?
+    if [ "$rc" -ne 0 ]; then
+      log "NG ffmpeg rc=$rc $FF_ERR"
+      alert "圧縮に失敗しました: $name"
+      return 1
+    fi
+    outsize="$(fsize "$out")"
+    if [ "$outsize" -le "$BUDGET" ]; then
+      log "OK $out $outsize bytes"
+      LAST_OUT="$out"
+      notify "$name → $(human "$outsize") に圧縮しました"
+      return 0
+    fi
+    log "over budget: $outsize > $BUDGET"
+    vkbps="$(ievl "$vkbps*$BUDGET/$outsize*0.93")"
+    if [ "$vkbps" -lt 30 ]; then vkbps=30; fi
+    pixb="$(lower_pixb "$pixb")"
+    attempt=$((attempt + 1))
+    PROG_LOG_STEP=-1
+  done
+  log "NG could not reach budget: $name"
+  alert "$name を ${TARGET_MB}MB 以下にできませんでした"
+  return 1
+}
+
+# ------------------------------- 引数処理 ------------------------------------
+mark_launch
+log "--- launch v$VERSION argc=$# ask=$ASK_SIZE progress=$PROGRESS"
+
+FILES=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --target) TARGET_MB="$2"; shift 2 ;;
+    --target=*) TARGET_MB="${1#*=}"; shift ;;
+    --ask) ASK_SIZE=1; shift ;;
+    --onepass) ONE_PASS=1; shift ;;
+    --gpu) ENCODER=gpu; shift ;;
+    --cpu) ENCODER=cpu; shift ;;
+    --encoder) ENCODER="$2"; shift 2 ;;
+    --encoder=*) ENCODER="${1#*=}"; shift ;;
+    --hevc) HEVC=1; shift ;;
+    --hwdecode) HWDECODE=1; shift ;;
+    --no-hwdecode) HWDECODE=0; shift ;;
+    --preset) PRESET="$2"; shift 2 ;;
+    --preset=*) PRESET="${1#*=}"; shift ;;
+    --outdir) OUT_DIR="$2"; shift 2 ;;
+    --outdir=*) OUT_DIR="${1#*=}"; shift ;;
+    --suffix) OUT_SUFFIX="$2"; shift 2 ;;
+    --suffix=*) OUT_SUFFIX="${1#*=}"; shift ;;
+    --force) SKIP_IF_FITS=0; shift ;;
+    --quiet) NOTIFY=0; shift ;;
+    --progress) PROGRESS="$2"; shift 2 ;;
+    --progress=*) PROGRESS="${1#*=}"; shift ;;
+    --doctor) DO_DOCTOR=1; shift ;;
+    --version) echo "discord-compress $VERSION"; exit 0 ;;
+    -h|--help) usage; exit 0 ;;
+    --) shift; while [ $# -gt 0 ]; do FILES+=("$1"); shift; done ;;
+    -*) printf '不明なオプション: %s\n' "$1" >&2; usage; exit 2 ;;
+    *) FILES+=("$1"); shift ;;
+  esac
+done
+
+if [ "$DO_DOCTOR" = "1" ]; then doctor; exit 0; fi
+
+if [ "${#FILES[@]}" -eq 0 ] && [ ! -t 0 ]; then
+  while IFS= read -r line; do
+    if [ -n "$line" ]; then FILES+=("$line"); fi
+  done
+fi
+
+NFILES="${#FILES[@]}"
+if [ "$NFILES" -eq 0 ]; then
+  alert "動画ファイルが渡されませんでした。"
+  exit 2
+fi
+
+find_tools
+detect_gpu
+resolve_encoder
+
+if [ "$ASK_SIZE" = "1" ]; then
+  ask_size || exit 0
+fi
+
+BUDGET="$(ievl "$TARGET_MB*1000000*$SAFETY")"
+PASSDIR="$(mktemp -d "${TMPDIR:-/tmp}/dcz.XXXXXX")"
+PASSLOG="$PASSDIR/pass"
+trap 'rm -rf "$PASSDIR" 2>/dev/null' EXIT
+
+FILE_TOTAL="$NFILES"
+prog_resolve
+log "=== run v$VERSION files=$NFILES target=${TARGET_MB}MB budget=$BUDGET enc=$VENC/$ENC_MODE preset=$PRESET onepass=$ONE_PASS progress=$PROG_MODE"
+notify "圧縮を開始します（${NFILES}本 / 目標 ${TARGET_MB}MB）"
+prog_emit 0 "準備中"
+
+OKC=0
+SKIPC=0
+NGC=0
+IDX=0
+for f in "${FILES[@]}"; do
+  IDX=$((IDX + 1))
+  FILE_IDX="$IDX"
+  PROG_NOTIFY_STEP=-1
+  compress_one "$f"
+  case $? in
+    0) OKC=$((OKC + 1)) ;;
+    2) SKIPC=$((SKIPC + 1)) ;;
+    *) NGC=$((NGC + 1)) ;;
+  esac
+done
+prog_end
+log "=== done ok=$OKC skipped=$SKIPC ng=$NGC"
+
+if [ "$NGC" -gt 0 ]; then
+  notify "完了: 成功 $OKC / スキップ $SKIPC / 失敗 $NGC"
+else
+  notify "完了: 成功 $OKC / スキップ $SKIPC"
+fi
+
+if [ "$REVEAL" = "1" ] && [ -n "$LAST_OUT" ]; then
+  osa_bg 15 -e "tell application \"Finder\" to reveal POSIX file \"$(osa_esc "$LAST_OUT")\"" >/dev/null 2>&1
+  osa_bg 10 -e 'tell application "Finder" to activate' >/dev/null 2>&1
+fi
+
+if [ "$NGC" -gt 0 ]; then exit 1; fi
+exit 0
